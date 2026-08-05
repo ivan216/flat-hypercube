@@ -318,6 +318,11 @@ impl Puzzle {
 
     pub fn turn_position(&self, pos: &mut Vec<i16>, turn: &Turn) -> Option<()> {
         let turn = self.normalize_turn(turn)?;
+        Self::apply_normalized_turn_to_position(pos, turn);
+        Some(())
+    }
+
+    fn apply_normalized_turn_to_position(pos: &mut Vec<i16>, turn: NormalizedTurn) {
         match turn {
             NormalizedTurn::Side {
                 side,
@@ -336,6 +341,34 @@ impl Puzzle {
                 pos.swap(from, to);
                 pos[from] *= -1;
             }
+        }
+    }
+
+    pub fn apply_turns_to_positions_batch(
+        &self,
+        positions: &mut [Vec<i16>],
+        turns: &[Turn],
+    ) -> Option<()> {
+        let turns: Vec<NormalizedTurn> = turns
+            .iter()
+            .map(|turn| self.normalize_turn(turn))
+            .collect::<Option<_>>()?;
+        if turns.is_empty() || positions.is_empty() {
+            return Some(());
+        }
+
+        let mut position_cache: HashMap<Vec<i16>, Vec<i16>> = HashMap::new();
+        for pos in positions {
+            if let Some(cached) = position_cache.get(pos) {
+                *pos = cached.clone();
+                continue;
+            }
+
+            let start = pos.clone();
+            for &turn in &turns {
+                Self::apply_normalized_turn_to_position(pos, turn);
+            }
+            position_cache.insert(start, pos.clone());
         }
         Some(())
     }
@@ -508,5 +541,29 @@ mod tests {
         assert!(batch.apply_turns_batch(&turns).is_some());
 
         assert_eq!(sequential.stickers, batch.stickers);
+    }
+
+    #[test]
+    fn batch_positions_match_sequential_positions() {
+        let puzzle = Puzzle::make_solved(3, 4);
+        let turns = sample_turns();
+        let mut sequential = vec![
+            vec![2, 2, 0, 0],
+            vec![2, 0, 2, 0],
+            vec![0, 0, 0, 0],
+            vec![2, 2, 0, 0],
+        ];
+        let mut batch = sequential.clone();
+
+        for turn in &turns {
+            for pos in &mut sequential {
+                assert!(puzzle.turn_position(pos, turn).is_some());
+            }
+        }
+        assert!(puzzle
+            .apply_turns_to_positions_batch(&mut batch, &turns)
+            .is_some());
+
+        assert_eq!(sequential, batch);
     }
 }

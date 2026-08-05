@@ -891,9 +891,9 @@ impl AppState {
     }
 
     fn apply_turns_to_clicked(&mut self, turns: &[Turn]) {
-        for turn in turns {
-            self.apply_turn_to_clicked(turn);
-        }
+        self.puzzle
+            .apply_turns_to_positions_batch(&mut self.clicked, turns)
+            .expect("turns already validated");
     }
 
     fn apply_turns_with_history(&mut self, turns: Vec<Turn>) {
