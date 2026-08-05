@@ -773,15 +773,11 @@ impl AppState {
     // this is a whole-puzzle rotation (PuzzleTurn) or a layer turn (SideTurn).
     // Returns None if the turn is invalid (e.g. degenerate plane).
     fn perform_turn(&mut self, side: i16, from: i16, to: i16) -> Option<()> {
-        let mut layer_min;
-        let mut layer_max;
         let turn = match self.current_turn.layer {
-            Some(TurnLayer::WholePuzzle) => {
-                layer_min = -self.puzzle.n + 1;
-                layer_max = self.puzzle.n - 1;
-                Turn::Puzzle(PuzzleTurn { from, to })
-            }
+            Some(TurnLayer::WholePuzzle) => Turn::Puzzle(PuzzleTurn { from, to }),
             _ => {
+                let mut layer_min;
+                let mut layer_max;
                 match self.current_turn.layer {
                     None => {
                         layer_min = self.puzzle.n - 1;
@@ -810,36 +806,11 @@ impl AppState {
             }
         };
 
-        // turn clicked stickers
-        {
-            let mut from = from;
-            let mut to = to;
-            let mut side = side;
-            let to_swap = (from < 0) != (to < 0);
-            if from < 0 {
-                from = !from
-            }
-            if to < 0 {
-                to = !to
-            }
-            if side < 0 {
-                side = !side
-            }
-            if to_swap {
-                std::mem::swap(&mut from, &mut to)
-            }
-            for clicked in &mut self.clicked {
-                if (layer_min - 1..=layer_max + 1).contains(&clicked[side as usize]) {
-                    clicked.swap(from as usize, to as usize);
-                    clicked[from as usize] *= -1
-                }
-            }
-        }
-
         let turn_clone = turn.clone();
         let turn_out = self.puzzle.turn(turn);
 
         if turn_out.is_some() {
+            self.apply_turn_to_clicked(&turn_clone);
             self.undo_history.push(turn_clone);
             self.set_solved_message_if_solved();
         }
@@ -905,16 +876,41 @@ impl AppState {
         }
     }
 
-    fn apply_reverse(&mut self, from: usize, to: usize) {
-        let turns: Vec<Turn> = self.undo_history[from..to]
+    fn reverse_turns(&self, from: usize, to: usize) -> Vec<Turn> {
+        self.undo_history[from..to]
             .iter()
             .rev()
-            .cloned()
-            .collect();
+            .map(|turn| turn.inverse())
+            .collect()
+    }
+
+    fn apply_turn_to_clicked(&mut self, turn: &Turn) {
+        for clicked in &mut self.clicked {
+            self.puzzle.turn_position(clicked, turn);
+        }
+    }
+
+    fn apply_turns_to_clicked(&mut self, turns: &[Turn]) {
         for turn in turns {
-            let inverse = turn.inverse();
-            self.puzzle.turn(inverse.clone());
-            self.undo_history.push(inverse);
+            self.apply_turn_to_clicked(turn);
+        }
+    }
+
+    fn apply_turns_with_history(&mut self, turns: Vec<Turn>) {
+        if turns.is_empty() {
+            return;
+        }
+
+        if self.puzzle.apply_turns_batch(&turns).is_some() {
+            self.apply_turns_to_clicked(&turns);
+            self.undo_history.extend(turns);
+        } else {
+            for turn in turns {
+                if self.puzzle.turn(turn.clone()).is_some() {
+                    self.apply_turn_to_clicked(&turn);
+                }
+                self.undo_history.push(turn);
+            }
         }
     }
 
@@ -923,7 +919,8 @@ impl AppState {
         if let Some(entry) = self.rev_stack.pop() {
             if let Some(r) = entry.end {
                 if self.undo_history.len() >= r {
-                    self.apply_reverse(entry.start, r);
+                    let turns = self.reverse_turns(entry.start, r);
+                    self.apply_turns_with_history(turns);
                     self.set_solved_message_if_solved();
                 }
             }
@@ -936,8 +933,9 @@ impl AppState {
             if let Some(r) = entry.end {
                 let p = self.undo_history.len();
                 if p >= r {
-                    self.apply_reverse(entry.start, r);
-                    self.apply_reverse(r, p);
+                    let mut turns = self.reverse_turns(entry.start, r);
+                    turns.extend(self.reverse_turns(r, p));
+                    self.apply_turns_with_history(turns);
                     self.set_solved_message_if_solved();
                 }
             }
@@ -1536,4 +1534,55 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(stdout_manager);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        AppState::new(
+            Some(3),
+            Some(3),
+            Prefs::load_default().expect("default prefs"),
+        )
+        .expect("valid test state")
+    }
+
+    #[test]
+    fn rev_unwind_updates_clicked_positions() {
+        let mut state = test_state();
+        let clicked = vec![2, 2, 0];
+        state.clicked.push(clicked.clone());
+
+        state.rev_start();
+        assert!(state.perform_turn(0, 1, 2).is_some());
+        assert_ne!(state.clicked[0], clicked);
+        state.rev_stop();
+
+        state.rev_unwind();
+
+        assert_eq!(state.clicked[0], clicked);
+        assert!(state.puzzle.is_solved());
+        assert_eq!(state.message.as_deref(), Some("solved!"));
+    }
+
+    #[test]
+    fn rev_commutator_updates_clicked_positions() {
+        let mut state = test_state();
+        let clicked = vec![2, 2, 0];
+        state.clicked.push(clicked.clone());
+
+        state.rev_start();
+        assert!(state.perform_turn(0, 1, 2).is_some());
+        state.rev_stop();
+        assert!(state.perform_turn(0, 1, 2).is_some());
+        assert_ne!(state.clicked[0], clicked);
+
+        state.rev_commutator();
+
+        assert_eq!(state.clicked[0], clicked);
+        assert!(state.puzzle.is_solved());
+        assert_eq!(state.message.as_deref(), Some("solved!"));
+    }
 }
