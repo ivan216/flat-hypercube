@@ -4,7 +4,7 @@ use rand::rngs::ThreadRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SideTurn {
     pub side: i16,
     pub layer_min: i16,
@@ -25,7 +25,7 @@ impl SideTurn {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PuzzleTurn {
     pub from: i16,
     pub to: i16,
@@ -40,7 +40,7 @@ impl PuzzleTurn {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Turn {
     Side(SideTurn),
     Puzzle(PuzzleTurn),
@@ -252,7 +252,7 @@ impl Puzzle {
         self.stickers.extend(new_stickers);
     }
 
-    fn apply_normalized_turn_to_permutation(
+    fn normalized_turn_cycles(
         &self,
         turn: NormalizedTurn,
         positions: &[Vec<i16>],
@@ -260,8 +260,7 @@ impl Puzzle {
         source_indices: &mut [usize],
         visited: &mut [bool],
         cycle: &mut Vec<usize>,
-        perm: &mut [usize],
-    ) {
+    ) -> Vec<Vec<usize>> {
         let len = positions.len();
         for (idx, source_idx) in source_indices.iter_mut().enumerate() {
             *source_idx = idx;
@@ -277,9 +276,10 @@ impl Puzzle {
             }
         }
         if !changed {
-            return;
+            return Vec::new();
         }
 
+        let mut cycles = Vec::new();
         for start in 0..len {
             if visited[start] {
                 continue;
@@ -294,12 +294,19 @@ impl Puzzle {
             }
 
             if cycle.len() > 1 {
-                let first = perm[cycle[0]];
-                for i in 0..cycle.len() - 1 {
-                    perm[cycle[i]] = perm[cycle[i + 1]];
-                }
-                perm[*cycle.last().expect("non-empty cycle")] = first;
+                cycles.push(cycle.clone());
             }
+        }
+        cycles
+    }
+
+    fn apply_cycles_to_permutation(cycles: &[Vec<usize>], perm: &mut [usize]) {
+        for cycle in cycles {
+            let first = perm[cycle[0]];
+            for i in 0..cycle.len() - 1 {
+                perm[cycle[i]] = perm[cycle[i + 1]];
+            }
+            perm[*cycle.last().expect("non-empty cycle")] = first;
         }
     }
 
@@ -334,9 +341,9 @@ impl Puzzle {
     }
 
     pub fn apply_turns_batch(&mut self, turns: &[Turn]) -> Option<()> {
-        let turns: Vec<NormalizedTurn> = turns
+        let turns: Vec<(Turn, NormalizedTurn)> = turns
             .iter()
-            .map(|turn| self.normalize_turn(turn))
+            .map(|turn| Some((turn.clone(), self.normalize_turn(turn)?)))
             .collect::<Option<_>>()?;
         if turns.is_empty() {
             return Some(());
@@ -354,17 +361,20 @@ impl Puzzle {
         let mut source_indices: Vec<usize> = vec![0; positions.len()];
         let mut visited = vec![false; positions.len()];
         let mut cycle = Vec::new();
+        let mut cycle_cache: HashMap<Turn, Vec<Vec<usize>>> = HashMap::new();
 
-        for turn in turns {
-            self.apply_normalized_turn_to_permutation(
-                turn,
-                &positions,
-                &pos_to_idx,
-                &mut source_indices,
-                &mut visited,
-                &mut cycle,
-                &mut perm,
-            );
+        for (turn, normalized) in turns {
+            let cycles = cycle_cache.entry(turn).or_insert_with(|| {
+                self.normalized_turn_cycles(
+                    normalized,
+                    &positions,
+                    &pos_to_idx,
+                    &mut source_indices,
+                    &mut visited,
+                    &mut cycle,
+                )
+            });
+            Self::apply_cycles_to_permutation(cycles, &mut perm);
         }
 
         for (dest_idx, pos) in positions.iter().enumerate() {
