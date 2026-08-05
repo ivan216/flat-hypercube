@@ -763,6 +763,12 @@ impl AppState {
         }
     }
 
+    fn set_solved_message_if_solved(&mut self) {
+        if self.puzzle.is_solved() {
+            self.message = Some("solved!".to_string());
+        }
+    }
+
     // Execute a puzzle turn. Reads self.current_turn.layer to decide whether
     // this is a whole-puzzle rotation (PuzzleTurn) or a layer turn (SideTurn).
     // Returns None if the turn is invalid (e.g. degenerate plane).
@@ -835,9 +841,7 @@ impl AppState {
 
         if turn_out.is_some() {
             self.undo_history.push(turn_clone);
-            if self.puzzle.is_solved() {
-                self.message = Some("solved!".to_string());
-            }
+            self.set_solved_message_if_solved();
         }
 
         turn_out
@@ -915,22 +919,26 @@ impl AppState {
     }
 
     fn rev_unwind(&mut self) {
+        self.message = None;
         if let Some(entry) = self.rev_stack.pop() {
             if let Some(r) = entry.end {
                 if self.undo_history.len() >= r {
                     self.apply_reverse(entry.start, r);
+                    self.set_solved_message_if_solved();
                 }
             }
         }
     }
 
     fn rev_commutator(&mut self) {
+        self.message = None;
         if let Some(entry) = self.rev_stack.pop() {
             if let Some(r) = entry.end {
                 let p = self.undo_history.len();
                 if p >= r {
                     self.apply_reverse(entry.start, r);
                     self.apply_reverse(r, p);
+                    self.set_solved_message_if_solved();
                 }
             }
         }
