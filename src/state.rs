@@ -218,7 +218,7 @@ struct AppLog {
 }
 
 impl AppState {
-    fn new(n: Option<i16>, d: Option<u16>, prefs: Prefs) -> Result<Self, String> {
+    pub fn new(n: Option<i16>, d: Option<u16>, prefs: Prefs) -> Result<Self, String> {
         let Some(n) = n else {
             return Err("n must be specified".into());
         };
@@ -773,7 +773,7 @@ impl AppState {
     // Execute a puzzle turn. Reads self.current_turn.layer to decide whether
     // this is a whole-puzzle rotation (PuzzleTurn) or a layer turn (SideTurn).
     // Returns None if the turn is invalid (e.g. degenerate plane).
-    fn perform_turn(&mut self, side: i16, from: i16, to: i16) -> Option<()> {
+    pub fn perform_turn(&mut self, side: i16, from: i16, to: i16) -> Option<()> {
         let turn = match self.current_turn.layer {
             Some(TurnLayer::WholePuzzle) => Turn::Puzzle(PuzzleTurn { from, to }),
             _ => {
@@ -860,14 +860,14 @@ impl AppState {
     }
 
     // Begin a reversion block — subsequent turns are grouped for F3/F4 undo.
-    fn rev_start(&mut self) {
+    pub fn rev_start(&mut self) {
         self.rev_stack.push(RevEntry {
             start: self.undo_history.len(),
             end: None,
         });
     }
 
-    fn rev_stop(&mut self) {
+    pub fn rev_stop(&mut self) {
         if let Some(top) = self.rev_stack.last() {
             if top.end.is_some() || self.undo_history.len() <= top.start {
                 self.rev_stack.pop();
@@ -915,7 +915,7 @@ impl AppState {
         }
     }
 
-    fn rev_unwind(&mut self) {
+    pub fn rev_unwind(&mut self) {
         self.message = None;
         if let Some(entry) = self.rev_stack.pop() {
             if let Some(r) = entry.end {
@@ -928,7 +928,7 @@ impl AppState {
         }
     }
 
-    fn rev_commutator(&mut self) {
+    pub fn rev_commutator(&mut self) {
         self.message = None;
         if let Some(entry) = self.rev_stack.pop() {
             if let Some(r) = entry.end {
@@ -1540,53 +1540,3 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_state() -> AppState {
-        AppState::new(
-            Some(3),
-            Some(3),
-            Prefs::load_default().expect("default prefs"),
-        )
-        .expect("valid test state")
-    }
-
-    #[test]
-    fn rev_unwind_updates_clicked_positions() {
-        let mut state = test_state();
-        let clicked = vec![2, 2, 0];
-        state.clicked.push(clicked.clone());
-
-        state.rev_start();
-        assert!(state.perform_turn(0, 1, 2).is_some());
-        assert_ne!(state.clicked[0], clicked);
-        state.rev_stop();
-
-        state.rev_unwind();
-
-        assert_eq!(state.clicked[0], clicked);
-        assert!(state.puzzle.is_solved());
-        assert_eq!(state.message.as_deref(), Some("solved!"));
-    }
-
-    #[test]
-    fn rev_commutator_updates_clicked_positions() {
-        let mut state = test_state();
-        let clicked = vec![2, 2, 0];
-        state.clicked.push(clicked.clone());
-
-        state.rev_start();
-        assert!(state.perform_turn(0, 1, 2).is_some());
-        state.rev_stop();
-        assert!(state.perform_turn(0, 1, 2).is_some());
-        assert_ne!(state.clicked[0], clicked);
-
-        state.rev_commutator();
-
-        assert_eq!(state.clicked[0], clicked);
-        assert!(state.puzzle.is_solved());
-        assert_eq!(state.message.as_deref(), Some("solved!"));
-    }
-}

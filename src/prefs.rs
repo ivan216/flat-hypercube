@@ -245,29 +245,3 @@ where
     let st = String::deserialize(deserializer)?;
     hex(&st).map_err(D::Error::custom)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_key_supports_control_escapes() {
-        assert_eq!(parse_key("\u{1b}").unwrap(), ESCAPE_CODE);
-        assert_eq!(parse_key("\u{8}").unwrap(), BACKSPACE_CODE);
-        assert_eq!(parse_key("\0").unwrap(), DISABLED_KEY_CODE);
-    }
-
-    #[test]
-    fn parse_key_supports_named_aliases() {
-        assert_eq!(parse_key("Escape").unwrap(), ESCAPE_CODE);
-        assert_eq!(parse_key("\\b").unwrap(), BACKSPACE_CODE);
-        assert_eq!(parse_key("None").unwrap(), DISABLED_KEY_CODE);
-    }
-
-    #[test]
-    fn parse_key_supports_legacy_symbols() {
-        assert_eq!(parse_key("⎋").unwrap(), ESCAPE_CODE);
-        assert_eq!(parse_key("⌫").unwrap(), BACKSPACE_CODE);
-        assert_eq!(parse_key("∅").unwrap(), DISABLED_KEY_CODE);
-    }
-}
