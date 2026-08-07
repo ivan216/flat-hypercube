@@ -7,8 +7,9 @@ use std::num::ParseIntError;
 use rgb2ansi256::rgb_to_ansi256;
 use serde::Deserialize;
 
-pub const ESCAPE_CODE: char = '⎋';
-pub const BACKSPACE_CODE: char = '⌫';
+pub const ESCAPE_CODE: char = '\x1b';
+pub const BACKSPACE_CODE: char = '\x08';
+pub const DISABLED_KEY_CODE: char = '\0';
 pub const DEFAULT_FILE_PATH_STR: &str = include_str!("../default_prefs.json");
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,13 +48,13 @@ impl Prefs {
         let mut sides = HashSet::new();
         for (i, ax) in self.axes.iter().enumerate() {
             for (dir, keys) in [("pos", &ax.pos.keys), ("neg", &ax.neg.keys)] {
-                if keys.select != '∅' && !selects.insert(keys.select) {
+                if !is_disabled_key(keys.select) && !selects.insert(keys.select) {
                     return Err(format!(
                         "duplicate select key '{0}' in axis {i} {dir}",
                         keys.select
                     ));
                 }
-                if keys.side != '∅' && !sides.insert(keys.side) {
+                if !is_disabled_key(keys.side) && !sides.insert(keys.side) {
                     return Err(format!(
                         "duplicate side key '{0}' in axis {i} {dir}",
                         keys.side
@@ -64,7 +65,7 @@ impl Prefs {
 
         let mut axis_keys = HashSet::new();
         for (i, ax) in self.axes.iter().enumerate() {
-            if ax.axis_key != '∅' && !axis_keys.insert(ax.axis_key) {
+            if !is_disabled_key(ax.axis_key) && !axis_keys.insert(ax.axis_key) {
                 return Err(format!(
                     "duplicate axis_key '{0}' in axis {i}",
                     ax.axis_key
@@ -116,6 +117,7 @@ impl Prefs {
 pub struct Axis {
     pub pos: Side,
     pub neg: Side,
+    #[serde(deserialize_with = "de_key")]
     pub axis_key: char,
 }
 
@@ -129,7 +131,9 @@ pub struct Side {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Keys {
+    #[serde(deserialize_with = "de_key")]
     pub select: char,
+    #[serde(deserialize_with = "de_key")]
     pub side: char,
 }
 
@@ -147,23 +151,82 @@ pub struct GlobalColors {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlobalKeys {
+    #[serde(deserialize_with = "de_key_vec")]
     pub layers: Vec<char>,
+    #[serde(deserialize_with = "de_key")]
     pub rotate: char,
+    #[serde(deserialize_with = "de_key")]
     pub scramble: char,
+    #[serde(deserialize_with = "de_key")]
     pub reset: char,
+    #[serde(deserialize_with = "de_key")]
     pub keybind_mode: char,
+    #[serde(deserialize_with = "de_key")]
     pub axis_mode: char,
+    #[serde(deserialize_with = "de_key")]
     pub undo: char,
+    #[serde(deserialize_with = "de_key")]
     pub redo: char,
+    #[serde(deserialize_with = "de_key")]
     pub next_filter: char,
+    #[serde(deserialize_with = "de_key")]
     pub prev_filter: char,
+    #[serde(deserialize_with = "de_key")]
     pub live_filter_mode: char,
+    #[serde(deserialize_with = "de_key")]
     pub reset_mode: char,
+    #[serde(deserialize_with = "de_key")]
     pub save: char,
+    #[serde(deserialize_with = "de_key")]
     pub rev_start: char,
+    #[serde(deserialize_with = "de_key")]
     pub rev_stop: char,
+    #[serde(deserialize_with = "de_key")]
     pub rev_unwind: char,
+    #[serde(deserialize_with = "de_key")]
     pub rev_commutator: char,
+}
+
+fn is_disabled_key(ch: char) -> bool {
+    ch == DISABLED_KEY_CODE
+}
+
+fn parse_key(st: &str) -> Result<char, String> {
+    match st {
+        "Esc" | "Escape" | "\\e" | "\\x1b" | "\\u001b" => return Ok(ESCAPE_CODE),
+        "Backspace" | "\\b" | "\\x08" | "\\u0008" => return Ok(BACKSPACE_CODE),
+        "None" | "Disabled" | "\\0" | "\\x00" | "\\u0000" => return Ok(DISABLED_KEY_CODE),
+        _ => {}
+    }
+
+    let mut chars = st.chars();
+    match (chars.next(), chars.next()) {
+        (Some('⎋'), None) => Ok(ESCAPE_CODE),
+        (Some('⌫'), None) => Ok(BACKSPACE_CODE),
+        (Some('∅'), None) => Ok(DISABLED_KEY_CODE),
+        (Some(ch), None) => Ok(ch),
+        _ => Err(format!(
+            "key must be one character or a supported key escape, got {st:?}"
+        )),
+    }
+}
+
+fn de_key<'de, D>(deserializer: D) -> Result<char, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let st = String::deserialize(deserializer)?;
+    parse_key(&st).map_err(D::Error::custom)
+}
+
+fn de_key_vec<'de, D>(deserializer: D) -> Result<Vec<char>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let keys = Vec::<String>::deserialize(deserializer)?;
+    keys.into_iter()
+        .map(|st| parse_key(&st).map_err(D::Error::custom))
+        .collect()
 }
 
 fn hex(st: &str) -> Result<Color, ParseIntError> {
@@ -181,4 +244,30 @@ where
 {
     let st = String::deserialize(deserializer)?;
     hex(&st).map_err(D::Error::custom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_supports_control_escapes() {
+        assert_eq!(parse_key("\u{1b}").unwrap(), ESCAPE_CODE);
+        assert_eq!(parse_key("\u{8}").unwrap(), BACKSPACE_CODE);
+        assert_eq!(parse_key("\0").unwrap(), DISABLED_KEY_CODE);
+    }
+
+    #[test]
+    fn parse_key_supports_named_aliases() {
+        assert_eq!(parse_key("Escape").unwrap(), ESCAPE_CODE);
+        assert_eq!(parse_key("\\b").unwrap(), BACKSPACE_CODE);
+        assert_eq!(parse_key("None").unwrap(), DISABLED_KEY_CODE);
+    }
+
+    #[test]
+    fn parse_key_supports_legacy_symbols() {
+        assert_eq!(parse_key("⎋").unwrap(), ESCAPE_CODE);
+        assert_eq!(parse_key("⌫").unwrap(), BACKSPACE_CODE);
+        assert_eq!(parse_key("∅").unwrap(), DISABLED_KEY_CODE);
+    }
 }

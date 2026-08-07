@@ -256,7 +256,7 @@
         "next_filter": "K",
         "prev_filter": "J",
         "live_filter_mode": "F",
-        "reset_mode": "⎋",
+        "reset_mode": "\u001b",
         "save": "S",
         "rev_start": "Q",
         "rev_stop": "W",

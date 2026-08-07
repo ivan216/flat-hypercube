@@ -3,6 +3,7 @@ use crate::filters::Filter;
 use crate::layout::Layout;
 use crate::prefs::Prefs;
 use crate::prefs::BACKSPACE_CODE;
+use crate::prefs::DISABLED_KEY_CODE;
 use crate::prefs::ESCAPE_CODE;
 use crate::puzzle::{ax, Puzzle, PuzzleTurn, SideTurn, Turn};
 use clap::Parser;
@@ -1511,6 +1512,9 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
                 color = state.prefs.global_colors.piece;
+                if ch == DISABLED_KEY_CODE {
+                    continue;
+                }
 
                 stdout
                     .queue(cursor::MoveTo(screen_x as u16, screen_y as u16))?
