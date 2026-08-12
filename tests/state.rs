@@ -53,12 +53,13 @@ fn slash_help_writes_output_and_exits_command_mode() {
     state.process_command_key(KeyCode::Enter);
 
     assert_eq!(state.mode, AppMode::Turn);
-    assert_eq!(state.command_history, vec!["help"]);
-    assert_eq!(state.output_hint.as_deref(), Some("commands:"));
-    assert!(state.output_lines.iter().any(|line| line == "commands:"));
+    assert_eq!(state.command.history, vec!["help"]);
+    assert_eq!(state.output.hint.as_deref(), Some("commands:"));
+    assert!(state.output.lines.iter().any(|line| line == "commands:"));
     assert!(
         state
-            .output_lines
+            .output
+            .lines
             .iter()
             .any(|line| line.starts_with("/status"))
     );
@@ -73,7 +74,7 @@ fn slash_clear_clears_output_panel() {
         state.process_command_key(KeyCode::Char(ch));
     }
     state.process_command_key(KeyCode::Enter);
-    assert!(!state.output_lines.is_empty());
+    assert!(!state.output.lines.is_empty());
 
     state.process_key('/');
     for ch in "clear".chars() {
@@ -81,7 +82,7 @@ fn slash_clear_clears_output_panel() {
     }
     state.process_command_key(KeyCode::Enter);
 
-    assert!(state.output_lines.is_empty());
+    assert!(state.output.lines.is_empty());
 }
 
 #[test]
@@ -93,7 +94,7 @@ fn panel_toggle_keeps_output_lines() {
         state.process_command_key(KeyCode::Char(ch));
     }
     state.process_command_key(KeyCode::Enter);
-    let output_after_help = state.output_lines.clone();
+    let output_after_help = state.output.lines.clone();
 
     state.process_key('/');
     for ch in "panel".chars() {
@@ -101,11 +102,11 @@ fn panel_toggle_keeps_output_lines() {
     }
     state.process_command_key(KeyCode::Enter);
 
-    assert!(state.output_panel_open);
+    assert!(state.output.open);
     assert!(
         output_after_help
             .iter()
-            .all(|line| state.output_lines.contains(line))
+            .all(|line| state.output.lines.contains(line))
     );
     assert_eq!(state.message.as_deref(), Some("output panel shown"));
 
@@ -115,11 +116,11 @@ fn panel_toggle_keeps_output_lines() {
     }
     state.process_command_key(KeyCode::Enter);
 
-    assert!(!state.output_panel_open);
+    assert!(!state.output.open);
     assert!(
         output_after_help
             .iter()
-            .all(|line| state.output_lines.contains(line))
+            .all(|line| state.output.lines.contains(line))
     );
     assert_eq!(state.message.as_deref(), Some("output panel hidden"));
 }
@@ -139,11 +140,11 @@ fn slash_does_not_open_hidden_output_panel() {
         state.process_command_key(KeyCode::Char(ch));
     }
     state.process_command_key(KeyCode::Enter);
-    assert!(state.output_panel_open);
+    assert!(state.output.open);
 
     state.process_key('/');
     assert!(matches!(state.mode, AppMode::Command));
-    assert!(state.output_panel_open);
+    assert!(state.output.open);
     state.process_command_key(KeyCode::Esc);
 
     state.process_key('/');
@@ -151,10 +152,10 @@ fn slash_does_not_open_hidden_output_panel() {
         state.process_command_key(KeyCode::Char(ch));
     }
     state.process_command_key(KeyCode::Enter);
-    assert!(!state.output_panel_open);
+    assert!(!state.output.open);
 
     state.process_key('/');
-    assert!(!state.output_panel_open);
+    assert!(!state.output.open);
 }
 
 #[test]
@@ -166,14 +167,14 @@ fn question_mark_toggles_output_panel() {
         state.process_command_key(KeyCode::Char(ch));
     }
     state.process_command_key(KeyCode::Enter);
-    assert!(!state.output_panel_open);
+    assert!(!state.output.open);
 
     state.process_key('?');
-    assert!(state.output_panel_open);
-    assert!(state.output_hint.is_none());
+    assert!(state.output.open);
+    assert!(state.output.hint.is_none());
 
     state.process_key('?');
-    assert!(!state.output_panel_open);
+    assert!(!state.output.open);
 }
 
 #[test]
@@ -186,8 +187,8 @@ fn command_output_sets_status_hint_when_panel_is_closed() {
     }
     state.process_command_key(KeyCode::Enter);
 
-    assert!(!state.output_panel_open);
-    assert_eq!(state.output_hint.as_deref(), Some("puzzle: 3^3"));
+    assert!(!state.output.open);
+    assert_eq!(state.output.hint.as_deref(), Some("puzzle: 3^3"));
 }
 
 #[test]
@@ -203,7 +204,7 @@ fn command_history_up_recalls_last_command() {
     state.process_key('/');
     state.process_command_key(KeyCode::Up);
 
-    assert_eq!(state.command_buffer, "status");
+    assert_eq!(state.command.buffer, "status");
 }
 
 #[test]
@@ -222,5 +223,5 @@ fn slash_reset_reuses_reset_behavior() {
     assert!(state.undo_history.is_empty());
     assert!(state.redo_history.is_empty());
     assert!(state.rev_stack.is_empty());
-    assert!(state.output_lines.iter().any(|line| line == "puzzle reset"));
+    assert!(state.output.lines.iter().any(|line| line == "puzzle reset"));
 }

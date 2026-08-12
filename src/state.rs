@@ -1,3 +1,6 @@
+use crate::commands::{
+    CommandInput, CommandKeyAction, CommandOutput, OUTPUT_PANEL_TOGGLE_KEY, command_help_lines,
+};
 use crate::filters;
 use crate::filters::Filter;
 use crate::layout::Layout;
@@ -6,6 +9,7 @@ use crate::prefs::DISABLED_KEY_CODE;
 use crate::prefs::ESCAPE_CODE;
 use crate::prefs::Prefs;
 use crate::puzzle::{Puzzle, PuzzleTurn, SideTurn, Turn, ax};
+use crate::terminal_ui::{ScreenLayout, draw_output_panel, draw_status_line};
 use clap::Parser;
 use crossterm::{
     ExecutableCommand, QueueableCommand, cursor,
@@ -28,10 +32,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const FRAME_LENGTH: Duration = Duration::from_millis(1000 / 30);
-const OUTPUT_PANEL_MAX_HEIGHT: u16 = 10;
-const OUTPUT_HISTORY_LIMIT: usize = 500;
-const OUTPUT_PANEL_TOGGLE_KEY: char = '?';
-const OUTPUT_PANEL_HINT: &str = " (press ? to toggle panel)";
 
 static CTRL_C_PRESSED: AtomicBool = AtomicBool::new(false);
 
@@ -191,7 +191,6 @@ pub struct AppState {
     pub keybind_set: KeybindSet,
     pub keybind_axial: KeybindAxial,
     pub message: Option<String>,
-    pub output_hint: Option<String>,
     pub undo_history: Vec<Turn>,
     pub redo_history: Vec<Turn>,
     pub filters: Vec<Filter>,
@@ -200,12 +199,8 @@ pub struct AppState {
     pub live_filter_string: String,
     pub live_filter_pending: Filter,
     pub live_filter: Filter,
-    pub command_buffer: String,
-    pub command_history: Vec<String>,
-    pub command_history_cursor: Option<usize>,
-    pub output_lines: Vec<String>,
-    pub output_scroll: usize,
-    pub output_panel_open: bool,
+    pub command: CommandInput,
+    pub output: CommandOutput,
     pub hovered: Option<(i16, i16)>,
     pub clicked: Vec<Vec<i16>>,
     pub filename: PathBuf,
@@ -269,7 +264,6 @@ impl AppState {
             keybind_set: KeybindSet::ThreeKey,
             keybind_axial: KeybindAxial::Axial,
             message: Default::default(),
-            output_hint: Default::default(),
             undo_history: Default::default(),
             redo_history: Default::default(),
             filters: vec![],
@@ -278,12 +272,8 @@ impl AppState {
             live_filter_string: "".to_string(),
             live_filter: Default::default(),
             live_filter_pending: Default::default(),
-            command_buffer: String::new(),
-            command_history: Vec::new(),
-            command_history_cursor: None,
-            output_lines: Vec::new(),
-            output_scroll: 0,
-            output_panel_open: false,
+            command: CommandInput::default(),
+            output: CommandOutput::default(),
             hovered: None,
             clicked: Vec::new(),
             filename: Self::new_filename(),
@@ -368,7 +358,7 @@ impl AppState {
         self.current_turn.clear();
         self.last_turn_keys.clear();
         self.live_filter_string = Default::default();
-        self.command_history_cursor = None;
+        self.command.history_cursor = None;
     }
 
     // for use in three-key strict mode
@@ -674,110 +664,41 @@ impl AppState {
     fn enter_command_mode(&mut self) {
         self.flush_modes();
         self.mode = AppMode::Command;
-        self.command_buffer.clear();
+        self.command.buffer.clear();
         self.message = None;
     }
 
     fn output_panel_visible(&self) -> bool {
-        self.output_panel_open && !self.output_lines.is_empty()
+        self.output.visible()
     }
 
     fn push_output_line(&mut self, line: impl Into<String>) {
-        self.output_lines.push(line.into());
-        if self.output_lines.len() > OUTPUT_HISTORY_LIMIT {
-            let trim = self.output_lines.len() - OUTPUT_HISTORY_LIMIT;
-            self.output_lines.drain(0..trim);
-        }
-        self.output_scroll = 0;
+        self.output.push_line(line);
     }
 
     fn push_output_lines(&mut self, lines: impl IntoIterator<Item = String>) {
-        for line in lines {
-            self.push_output_line(line);
-        }
+        self.output.push_lines(lines);
     }
 
     pub fn process_command_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Esc => {
+        match self.command.handle_key(code, &mut self.output) {
+            CommandKeyAction::Cancel => {
                 self.mode = AppMode::Turn;
-                self.command_buffer.clear();
-                self.command_history_cursor = None;
             }
-            KeyCode::Enter => self.submit_command(),
-            KeyCode::Backspace => {
-                self.command_buffer.pop();
-                self.command_history_cursor = None;
+            CommandKeyAction::Submit(command) => {
+                self.mode = AppMode::Turn;
+                self.submit_command(command);
             }
-            KeyCode::Char(c) => {
-                self.command_buffer.push(c);
-                self.command_history_cursor = None;
-            }
-            KeyCode::Up => self.command_history_prev(),
-            KeyCode::Down => self.command_history_next(),
-            KeyCode::PageUp if self.output_panel_open => {
-                self.output_scroll = self.output_scroll.saturating_add(5)
-            }
-            KeyCode::PageDown if self.output_panel_open => {
-                self.output_scroll = self.output_scroll.saturating_sub(5)
-            }
-            _ => {}
+            CommandKeyAction::None => {}
         }
     }
 
-    fn command_history_prev(&mut self) {
-        if self.command_history.is_empty() {
-            return;
-        }
-
-        let next = match self.command_history_cursor {
-            None => self.command_history.len() - 1,
-            Some(0) => 0,
-            Some(i) => i - 1,
-        };
-        self.command_history_cursor = Some(next);
-        self.command_buffer = self.command_history[next].clone();
-    }
-
-    fn command_history_next(&mut self) {
-        let Some(cursor) = self.command_history_cursor else {
-            return;
-        };
-
-        if cursor + 1 >= self.command_history.len() {
-            self.command_history_cursor = None;
-            self.command_buffer.clear();
-        } else {
-            let next = cursor + 1;
-            self.command_history_cursor = Some(next);
-            self.command_buffer = self.command_history[next].clone();
-        }
-    }
-
-    fn submit_command(&mut self) {
-        let command = self.command_buffer.trim().to_string();
-        self.mode = AppMode::Turn;
-        self.command_buffer.clear();
-        self.command_history_cursor = None;
-        self.output_hint = None;
-        if command.is_empty() {
-            return;
-        }
-
-        self.command_history.push(command.clone());
-        if !command.eq_ignore_ascii_case("panel") {
-            self.output_lines.push(format!("> /{}", command));
-            if self.output_lines.len() > OUTPUT_HISTORY_LIMIT {
-                let trim = self.output_lines.len() - OUTPUT_HISTORY_LIMIT;
-                self.output_lines.drain(0..trim);
-            }
-            self.output_scroll = 0;
-        }
-        let command_output_start = self.output_lines.len();
+    fn submit_command(&mut self, command: String) {
+        self.output.hint = None;
+        self.output.push_command_echo(&command);
+        let command_output_start = self.output.lines.len();
         self.execute_command(&command);
-        if !self.output_panel_open {
-            self.output_hint = self.output_lines.get(command_output_start).cloned();
-        }
+        self.output.set_closed_hint_from(command_output_start);
     }
 
     fn execute_command(&mut self, command: &str) {
@@ -788,11 +709,7 @@ impl AppState {
 
         match name.as_str() {
             "help" => self.push_output_lines(command_help_lines()),
-            "clear" => {
-                self.output_lines.clear();
-                self.output_scroll = 0;
-                self.output_panel_open = false;
-            }
+            "clear" => self.output.clear(),
             "panel" => self.toggle_output_panel(),
             "status" => self.push_output_lines(self.status_lines()),
             "moves" => self.push_output_lines(self.move_lines()),
@@ -811,17 +728,7 @@ impl AppState {
     }
 
     fn toggle_output_panel(&mut self) {
-        if self.output_lines.is_empty() {
-            self.message = Some("output panel is empty".to_string());
-            return;
-        }
-
-        self.output_panel_open = !self.output_panel_open;
-        if self.output_panel_open {
-            self.message = Some("output panel shown".to_string());
-        } else {
-            self.message = Some("output panel hidden".to_string());
-        }
+        self.message = self.output.toggle().map(str::to_string);
     }
 
     fn execute_rev_command(&mut self, args: &[&str]) {
@@ -899,7 +806,7 @@ impl AppState {
     // mode-specific try_* methods for turn input.
     pub fn process_key(&mut self, c: char) {
         self.message = None;
-        self.output_hint = None;
+        self.output.hint = None;
         if matches!(self.mode, AppMode::Turn) && c == OUTPUT_PANEL_TOGGLE_KEY {
             self.toggle_output_panel();
             return;
@@ -1118,7 +1025,7 @@ impl AppState {
         if let Some(message) = &self.message {
             return message.to_string();
         }
-        if let Some(output_hint) = &self.output_hint {
+        if let Some(output_hint) = &self.output.hint {
             return output_hint.to_string();
         }
         match self.mode {
@@ -1130,7 +1037,7 @@ impl AppState {
                 }
             }
             AppMode::LiveFilter => format!("live filter: {}", self.live_filter_string),
-            AppMode::Command => format!("/{}", self.command_buffer),
+            AppMode::Command => format!("/{}", self.command.buffer),
         }
     }
 
@@ -1289,117 +1196,6 @@ impl AppState {
     }
 }
 
-fn command_help_lines() -> Vec<String> {
-    vec![
-        "commands:".to_string(),
-        "/help - show this list".to_string(),
-        "/clear - clear the output panel".to_string(),
-        "/panel or ? - fold or unfold the output panel".to_string(),
-        "/status - show puzzle and input state".to_string(),
-        "/moves - show the last 20 moves".to_string(),
-        "/save - save the current session".to_string(),
-        "/scramble - scramble the puzzle".to_string(),
-        "/reset - reset the puzzle".to_string(),
-        "/rev start|stop|unwind|comm - manage reversion blocks".to_string(),
-    ]
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScreenLayout {
-    puzzle_height: u16,
-    output_top: u16,
-    output_height: u16,
-    rev_row: u16,
-    status_row: u16,
-}
-
-impl ScreenLayout {
-    fn new(term_h: u16, state: &AppState) -> Self {
-        let base_rows = term_h.min(2);
-        let output_height = if state.output_panel_visible() {
-            term_h
-                .saturating_sub(base_rows + 1)
-                .min(OUTPUT_PANEL_MAX_HEIGHT)
-        } else {
-            0
-        };
-        let reserved = output_height + base_rows;
-        let puzzle_height = term_h.saturating_sub(reserved).max(1);
-        let output_top = puzzle_height;
-        let rev_row = term_h.saturating_sub(2);
-        let status_row = term_h.saturating_sub(1);
-
-        Self {
-            puzzle_height,
-            output_top,
-            output_height,
-            rev_row,
-            status_row,
-        }
-    }
-}
-
-fn draw_output_panel(
-    stdout: &mut io::Stdout,
-    state: &AppState,
-    layout: ScreenLayout,
-    term_w: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if layout.output_height == 0 {
-        return Ok(());
-    }
-
-    let end = state.output_lines.len().saturating_sub(state.output_scroll);
-    let start = end.saturating_sub(layout.output_height as usize);
-    let visible = &state.output_lines[start..end];
-
-    for i in 0..layout.output_height {
-        stdout
-            .queue(cursor::MoveTo(0, layout.output_top + i))?
-            .queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
-        if let Some(line) = visible.get(i as usize) {
-            stdout.queue(style::Print(truncate_to_width(line, term_w)))?;
-        }
-    }
-
-    Ok(())
-}
-
-fn draw_status_line(
-    stdout: &mut io::Stdout,
-    state: &AppState,
-    row: u16,
-    term_w: u16,
-    message: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    stdout
-        .queue(cursor::MoveTo(0, row))?
-        .queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
-
-    let show_hint = state.output_hint.as_deref() == Some(message) && !state.output_panel_open;
-    if !show_hint {
-        stdout.queue(style::Print(truncate_to_width(message, term_w)))?;
-        return Ok(());
-    }
-
-    let hint_len = OUTPUT_PANEL_HINT.chars().count() as u16;
-    let message_width = term_w.saturating_sub(hint_len);
-    let display_message = truncate_to_width(message, message_width.max(1));
-    let used = display_message.chars().count() as u16;
-    stdout.queue(style::Print(display_message))?;
-
-    if used < term_w {
-        let hint = truncate_to_width(OUTPUT_PANEL_HINT, term_w - used);
-        stdout.queue(style::PrintStyledContent(hint.with(style::Color::DarkGrey)))?;
-    }
-
-    Ok(())
-}
-
-fn truncate_to_width(line: &str, width: u16) -> String {
-    line.chars().take(width as usize).collect()
-}
-
 fn draw_brackets(
     stdout: &mut io::Stdout,
     x: i16,
@@ -1533,7 +1329,7 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
     const SCROLL_STEP_WHEEL: i16 = 3;
 
     let (mut term_w, mut term_h) = terminal::size()?;
-    let mut screen_layout = ScreenLayout::new(term_h, &state);
+    let mut screen_layout = ScreenLayout::new(term_h, state.output_panel_visible());
     let mut scroll_max_x = layout.width.saturating_sub(term_w) as i16;
     let mut scroll_max_y = layout.height.saturating_sub(screen_layout.puzzle_height) as i16;
     let mut scroll_x: i16 = 0;
@@ -1547,8 +1343,8 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
         let previous_screen_layout = screen_layout;
         let previous_message = state.get_message();
         let previous_rev_stack = state.rev_stack_display();
-        let previous_output_lines = state.output_lines.clone();
-        let previous_output_scroll = state.output_scroll;
+        let previous_output_lines = state.output.lines.clone();
+        let previous_output_scroll = state.output.scroll;
         let previous_hovered = state.hovered;
         let previous_clicked_stickers = state.clicked_stickers();
         let mut just_resized = false;
@@ -1571,12 +1367,12 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     match code {
-                        KeyCode::PageUp if state.output_panel_open => {
-                            state.output_scroll = state.output_scroll.saturating_add(5);
+                        KeyCode::PageUp if state.output.open => {
+                            state.output.page_up();
                             continue;
                         }
-                        KeyCode::PageDown if state.output_panel_open => {
-                            state.output_scroll = state.output_scroll.saturating_sub(5);
+                        KeyCode::PageDown if state.output.open => {
+                            state.output.page_down();
                             continue;
                         }
                         _ => {}
@@ -1747,7 +1543,7 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
                     let (new_w, new_h) = terminal::size()?;
                     term_w = new_w;
                     term_h = new_h;
-                    screen_layout = ScreenLayout::new(term_h, &state);
+                    screen_layout = ScreenLayout::new(term_h, state.output_panel_visible());
                     scroll_max_x = layout.width.saturating_sub(term_w) as i16;
                     scroll_max_y = layout.height.saturating_sub(screen_layout.puzzle_height) as i16;
                     scroll_x = scroll_x.min(scroll_max_x);
@@ -1763,21 +1559,13 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             break 'event;
         }
 
-        screen_layout = ScreenLayout::new(term_h, &state);
+        screen_layout = ScreenLayout::new(term_h, state.output_panel_visible());
         scroll_max_x = layout.width.saturating_sub(term_w) as i16;
         scroll_max_y = layout.height.saturating_sub(screen_layout.puzzle_height) as i16;
         scroll_x = scroll_x.min(scroll_max_x);
         scroll_y = scroll_y.min(scroll_max_y);
 
-        if screen_layout.output_height > 0 {
-            let max_output_scroll = state
-                .output_lines
-                .len()
-                .saturating_sub(screen_layout.output_height as usize);
-            state.output_scroll = state.output_scroll.min(max_output_scroll);
-        } else {
-            state.output_scroll = 0;
-        }
+        state.output.clamp_scroll(screen_layout.output_height);
 
         let scrolled = (scroll_x, scroll_y) != scroll_before;
         let screen_layout_changed = previous_screen_layout != screen_layout;
@@ -1787,8 +1575,8 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
 
         let message = state.get_message();
         let rev_stack_display = state.rev_stack_display();
-        let output_changed = previous_output_lines != state.output_lines
-            || previous_output_scroll != state.output_scroll;
+        let output_changed = previous_output_lines != state.output.lines
+            || previous_output_scroll != state.output.scroll;
 
         if just_resized {
             stdout
@@ -1798,7 +1586,7 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if output_changed || scrolled || just_resized || screen_layout_changed {
-            draw_output_panel(&mut stdout, &state, screen_layout, term_w)?;
+            draw_output_panel(&mut stdout, &state.output, screen_layout, term_w)?;
         }
 
         if previous_rev_stack != rev_stack_display
@@ -1814,13 +1602,7 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if previous_message != message || scrolled || just_resized || screen_layout_changed {
-            draw_status_line(
-                &mut stdout,
-                &state,
-                screen_layout.status_row,
-                term_w,
-                &message,
-            )?;
+            draw_status_line(&mut stdout, &state.output, screen_layout, term_w, &message)?;
         }
 
         if let Some((x, y)) = previous_hovered {
