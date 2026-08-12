@@ -193,7 +193,13 @@ impl Layout {
         lower
     }
 
-    pub fn make_layout(n: i16, d: u16, semi_compact: bool, compact: bool, vertical: bool) -> Layout {
+    pub fn make_layout(
+        n: i16,
+        d: u16,
+        semi_compact: bool,
+        compact: bool,
+        vertical: bool,
+    ) -> Layout {
         let gaps = compute_gaps(n, d, semi_compact, compact);
         Self::make_layout_inner(n, d, vertical, &gaps)
     }
@@ -244,8 +250,7 @@ impl Layout {
 
                 row.push(lower);
             }
-            let gap_idx = d as usize
-                + if vertical && d % 2 == 1 { 1 } else { 0 };
+            let gap_idx = d as usize + if vertical && d % 2 == 1 { 1 } else { 0 };
             if make_horizontal {
                 Self::concat_horiz(row, gaps[gap_idx])
             } else {
@@ -275,7 +280,9 @@ impl Layout {
             } else if d == 1 {
                 for ((x, y), pos) in layer.points.clone().iter() {
                     if !pos.iter().any(|&v| v.abs() == 2) {
-                        layer.keybind_hints.insert((*x, *y), Some(if i == -1 { !0 } else { 0 }));
+                        layer
+                            .keybind_hints
+                            .insert((*x, *y), Some(if i == -1 { !0 } else { 0 }));
                     }
                 }
             } else if d == 2 {

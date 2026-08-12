@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use crossterm::style::Color;
-use serde::de::Error;
 use serde::Deserializer;
+use serde::de::Error;
 use std::num::ParseIntError;
 
 use rgb2ansi256::rgb_to_ansi256;
@@ -66,16 +66,17 @@ impl Prefs {
         let mut axis_keys = HashSet::new();
         for (i, ax) in self.axes.iter().enumerate() {
             if !is_disabled_key(ax.axis_key) && !axis_keys.insert(ax.axis_key) {
-                return Err(format!(
-                    "duplicate axis_key '{0}' in axis {i}",
-                    ax.axis_key
-                ));
+                return Err(format!("duplicate axis_key '{0}' in axis {i}", ax.axis_key));
             }
         }
 
         // Any axis key must not conflict with global keys
-        let all: HashSet<char> = selects.iter()
-            .chain(sides.iter()).chain(axis_keys.iter()).copied().collect();
+        let all: HashSet<char> = selects
+            .iter()
+            .chain(sides.iter())
+            .chain(axis_keys.iter())
+            .copied()
+            .collect();
         let gk = &self.global_keys;
         for (i, &ch) in gk.layers.iter().enumerate() {
             if all.contains(&ch) {
@@ -103,9 +104,7 @@ impl Prefs {
             ("global rev_commutator", gk.rev_commutator),
         ] {
             if all.contains(&ch) {
-                return Err(format!(
-                    "key '{ch}' in {label} conflicts with an axis key"
-                ));
+                return Err(format!("key '{ch}' in {label} conflicts with an axis key"));
             }
         }
 

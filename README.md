@@ -68,6 +68,10 @@ Global controls:
 - `Shift+Z`: redo.
 - `Esc`: clear the current input or status mode.
 - `Shift+S`: save the current session.
+- `/`: enter slash-command mode.
+- `?`: show or hide the command output panel.
+
+When a slash command produces output while the panel is hidden, the first output line appears in the status line. Press `?` to open the full output panel.
 
 View controls:
 

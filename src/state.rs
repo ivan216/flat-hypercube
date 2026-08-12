@@ -1,19 +1,19 @@
 use crate::filters;
 use crate::filters::Filter;
 use crate::layout::Layout;
-use crate::prefs::Prefs;
 use crate::prefs::BACKSPACE_CODE;
 use crate::prefs::DISABLED_KEY_CODE;
 use crate::prefs::ESCAPE_CODE;
-use crate::puzzle::{ax, Puzzle, PuzzleTurn, SideTurn, Turn};
+use crate::prefs::Prefs;
+use crate::puzzle::{Puzzle, PuzzleTurn, SideTurn, Turn, ax};
 use clap::Parser;
 use crossterm::{
-    cursor,
+    ExecutableCommand, QueueableCommand, cursor,
     event::{
         self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     style::{self, Stylize},
-    terminal, ExecutableCommand, QueueableCommand,
+    terminal,
 };
 use rand::rngs::ThreadRng;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const FRAME_LENGTH: Duration = Duration::from_millis(1000 / 30);
+const OUTPUT_PANEL_MAX_HEIGHT: u16 = 10;
+const OUTPUT_HISTORY_LIMIT: usize = 500;
+const OUTPUT_PANEL_TOGGLE_KEY: char = '?';
+const OUTPUT_PANEL_HINT: &str = " (press ? to toggle panel)";
 
 static CTRL_C_PRESSED: AtomicBool = AtomicBool::new(false);
 
@@ -123,11 +127,7 @@ impl KeybindSet {
             Self::FixedKey => Self::ThreeKey, //Self::XyzKey,
                                               //Self::XyzKey => Self::ThreeKey,
         };
-        if !next.valid(n) {
-            next.next(n)
-        } else {
-            next
-        }
+        if !next.valid(n) { next.next(n) } else { next }
     }
 
     fn name(&self) -> String {
@@ -145,6 +145,7 @@ pub enum AppMode {
     #[default]
     Turn,
     LiveFilter,
+    Command,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -190,6 +191,7 @@ pub struct AppState {
     pub keybind_set: KeybindSet,
     pub keybind_axial: KeybindAxial,
     pub message: Option<String>,
+    pub output_hint: Option<String>,
     pub undo_history: Vec<Turn>,
     pub redo_history: Vec<Turn>,
     pub filters: Vec<Filter>,
@@ -198,6 +200,12 @@ pub struct AppState {
     pub live_filter_string: String,
     pub live_filter_pending: Filter,
     pub live_filter: Filter,
+    pub command_buffer: String,
+    pub command_history: Vec<String>,
+    pub command_history_cursor: Option<usize>,
+    pub output_lines: Vec<String>,
+    pub output_scroll: usize,
+    pub output_panel_open: bool,
     pub hovered: Option<(i16, i16)>,
     pub clicked: Vec<Vec<i16>>,
     pub filename: PathBuf,
@@ -261,6 +269,7 @@ impl AppState {
             keybind_set: KeybindSet::ThreeKey,
             keybind_axial: KeybindAxial::Axial,
             message: Default::default(),
+            output_hint: Default::default(),
             undo_history: Default::default(),
             redo_history: Default::default(),
             filters: vec![],
@@ -269,6 +278,12 @@ impl AppState {
             live_filter_string: "".to_string(),
             live_filter: Default::default(),
             live_filter_pending: Default::default(),
+            command_buffer: String::new(),
+            command_history: Vec::new(),
+            command_history_cursor: None,
+            output_lines: Vec::new(),
+            output_scroll: 0,
+            output_panel_open: false,
             hovered: None,
             clicked: Vec::new(),
             filename: Self::new_filename(),
@@ -319,10 +334,41 @@ impl AppState {
         Ok(())
     }
 
+    fn reset_puzzle(&mut self) -> String {
+        self.puzzle = Puzzle::make_solved(self.puzzle.n, self.puzzle.d);
+        self.scramble = self.puzzle.clone();
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.rev_stack.clear();
+        "puzzle reset".to_string()
+    }
+
+    fn scramble_puzzle(&mut self) -> String {
+        if self.puzzle.d < 3 {
+            return "scramble requires d >= 3".to_string();
+        }
+
+        self.puzzle = Puzzle::make_solved(self.puzzle.n, self.puzzle.d);
+        self.puzzle.scramble(&mut self.rng);
+        self.scramble = self.puzzle.clone();
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.rev_stack.clear();
+        "scrambled with 5000 turns".to_string()
+    }
+
+    fn save_message(&self) -> String {
+        match self.save() {
+            Ok(()) => format!("saved to {}", self.filename.display()),
+            Err(_) => "could not save".to_string(),
+        }
+    }
+
     fn flush_modes(&mut self) {
         self.current_turn.clear();
         self.last_turn_keys.clear();
         self.live_filter_string = Default::default();
+        self.command_history_cursor = None;
     }
 
     // for use in three-key strict mode
@@ -342,8 +388,7 @@ impl AppState {
         if c == self.prefs.global_keys.axis_mode {
             self.flush_modes();
             self.keybind_axial = self.keybind_axial.next();
-            self.message =
-                Some(format!("set axis mode to {}", self.keybind_axial.name()));
+            self.message = Some(format!("set axis mode to {}", self.keybind_axial.name()));
             return true;
         }
         if c == self.prefs.global_keys.undo {
@@ -482,18 +527,17 @@ impl AppState {
         }
 
         if let Some(from_kp) = self.current_turn.from {
-            let (from_norm, to_norm) =
-                if self.current_turn.layer == Some(TurnLayer::WholePuzzle) {
-                    let f = ax(from_kp.axis);
-                    let t = ax(kp.axis);
-                    if (from_kp.axis < 0) != (kp.axis < 0) {
-                        (t, f)
-                    } else {
-                        (f, t)
-                    }
+            let (from_norm, to_norm) = if self.current_turn.layer == Some(TurnLayer::WholePuzzle) {
+                let f = ax(from_kp.axis);
+                let t = ax(kp.axis);
+                if (from_kp.axis < 0) != (kp.axis < 0) {
+                    (t, f)
                 } else {
-                    (from_kp.axis, kp.axis)
-                };
+                    (f, t)
+                }
+            } else {
+                (from_kp.axis, kp.axis)
+            };
             // perform_turn must be called BEFORE clearing any state
             if self.perform_turn(side_axis, from_norm, to_norm).is_some() {
                 let mut keys = self.current_turn.current_keys();
@@ -521,7 +565,9 @@ impl AppState {
         if self.puzzle.d < 3 {
             return;
         }
-        let Some(kp) = self.get_axis_key(c) else { return };
+        let Some(kp) = self.get_axis_key(c) else {
+            return;
+        };
         if ax(kp.axis) as u16 >= self.puzzle.d {
             return;
         }
@@ -575,7 +621,12 @@ impl AppState {
         if !sign {
             std::mem::swap(&mut from, &mut to);
         }
-        let side_axis = self.current_turn.side.as_ref().map(|kp| kp.axis).unwrap_or(0);
+        let side_axis = self
+            .current_turn
+            .side
+            .as_ref()
+            .map(|kp| kp.axis)
+            .unwrap_or(0);
         // Capture canonical string BEFORE clearing fixed
         if self.perform_turn(side_axis, from, to).is_some() {
             self.last_turn_keys = self.current_turn.current_keys();
@@ -591,20 +642,256 @@ impl AppState {
             .axes
             .iter()
             .position(|ax| ax.pos.keys.select == c)
-            .map(|s| KeyPress { ch: c, axis: s as i16 })
+            .map(|s| KeyPress {
+                ch: c,
+                axis: s as i16,
+            })
             .or_else(|| {
                 self.prefs
                     .axes
                     .iter()
                     .position(|ax| ax.neg.keys.select == c)
-                    .map(|s| KeyPress { ch: c, axis: !(s as i16) })
+                    .map(|s| KeyPress {
+                        ch: c,
+                        axis: !(s as i16),
+                    })
             })
     }
 
     pub fn make_layout(&self, semi_compact: bool, compact: bool, vertical: bool) -> Layout {
-        let mut layout = Layout::make_layout(self.puzzle.n, self.puzzle.d, semi_compact, compact, vertical).move_right(1);
+        let mut layout = Layout::make_layout(
+            self.puzzle.n,
+            self.puzzle.d,
+            semi_compact,
+            compact,
+            vertical,
+        )
+        .move_right(1);
         layout.width += 1; // reserve rightmost column for brackets
         layout
+    }
+
+    fn enter_command_mode(&mut self) {
+        self.flush_modes();
+        self.mode = AppMode::Command;
+        self.command_buffer.clear();
+        self.message = None;
+    }
+
+    fn output_panel_visible(&self) -> bool {
+        self.output_panel_open && !self.output_lines.is_empty()
+    }
+
+    fn push_output_line(&mut self, line: impl Into<String>) {
+        self.output_lines.push(line.into());
+        if self.output_lines.len() > OUTPUT_HISTORY_LIMIT {
+            let trim = self.output_lines.len() - OUTPUT_HISTORY_LIMIT;
+            self.output_lines.drain(0..trim);
+        }
+        self.output_scroll = 0;
+    }
+
+    fn push_output_lines(&mut self, lines: impl IntoIterator<Item = String>) {
+        for line in lines {
+            self.push_output_line(line);
+        }
+    }
+
+    pub fn process_command_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.mode = AppMode::Turn;
+                self.command_buffer.clear();
+                self.command_history_cursor = None;
+            }
+            KeyCode::Enter => self.submit_command(),
+            KeyCode::Backspace => {
+                self.command_buffer.pop();
+                self.command_history_cursor = None;
+            }
+            KeyCode::Char(c) => {
+                self.command_buffer.push(c);
+                self.command_history_cursor = None;
+            }
+            KeyCode::Up => self.command_history_prev(),
+            KeyCode::Down => self.command_history_next(),
+            KeyCode::PageUp if self.output_panel_open => {
+                self.output_scroll = self.output_scroll.saturating_add(5)
+            }
+            KeyCode::PageDown if self.output_panel_open => {
+                self.output_scroll = self.output_scroll.saturating_sub(5)
+            }
+            _ => {}
+        }
+    }
+
+    fn command_history_prev(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        let next = match self.command_history_cursor {
+            None => self.command_history.len() - 1,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.command_history_cursor = Some(next);
+        self.command_buffer = self.command_history[next].clone();
+    }
+
+    fn command_history_next(&mut self) {
+        let Some(cursor) = self.command_history_cursor else {
+            return;
+        };
+
+        if cursor + 1 >= self.command_history.len() {
+            self.command_history_cursor = None;
+            self.command_buffer.clear();
+        } else {
+            let next = cursor + 1;
+            self.command_history_cursor = Some(next);
+            self.command_buffer = self.command_history[next].clone();
+        }
+    }
+
+    fn submit_command(&mut self) {
+        let command = self.command_buffer.trim().to_string();
+        self.mode = AppMode::Turn;
+        self.command_buffer.clear();
+        self.command_history_cursor = None;
+        self.output_hint = None;
+        if command.is_empty() {
+            return;
+        }
+
+        self.command_history.push(command.clone());
+        if !command.eq_ignore_ascii_case("panel") {
+            self.output_lines.push(format!("> /{}", command));
+            if self.output_lines.len() > OUTPUT_HISTORY_LIMIT {
+                let trim = self.output_lines.len() - OUTPUT_HISTORY_LIMIT;
+                self.output_lines.drain(0..trim);
+            }
+            self.output_scroll = 0;
+        }
+        let command_output_start = self.output_lines.len();
+        self.execute_command(&command);
+        if !self.output_panel_open {
+            self.output_hint = self.output_lines.get(command_output_start).cloned();
+        }
+    }
+
+    fn execute_command(&mut self, command: &str) {
+        let parts: Vec<&str> = command.split_whitespace().collect();
+        let Some(name) = parts.first().map(|part| part.to_ascii_lowercase()) else {
+            return;
+        };
+
+        match name.as_str() {
+            "help" => self.push_output_lines(command_help_lines()),
+            "clear" => {
+                self.output_lines.clear();
+                self.output_scroll = 0;
+                self.output_panel_open = false;
+            }
+            "panel" => self.toggle_output_panel(),
+            "status" => self.push_output_lines(self.status_lines()),
+            "moves" => self.push_output_lines(self.move_lines()),
+            "save" => self.push_output_line(self.save_message()),
+            "scramble" => {
+                let message = self.scramble_puzzle();
+                self.push_output_line(message);
+            }
+            "reset" => {
+                let message = self.reset_puzzle();
+                self.push_output_line(message);
+            }
+            "rev" => self.execute_rev_command(&parts[1..]),
+            _ => self.push_output_line(format!("unknown command: {}", parts[0])),
+        }
+    }
+
+    fn toggle_output_panel(&mut self) {
+        if self.output_lines.is_empty() {
+            self.message = Some("output panel is empty".to_string());
+            return;
+        }
+
+        self.output_panel_open = !self.output_panel_open;
+        if self.output_panel_open {
+            self.message = Some("output panel shown".to_string());
+        } else {
+            self.message = Some("output panel hidden".to_string());
+        }
+    }
+
+    fn execute_rev_command(&mut self, args: &[&str]) {
+        let Some(subcommand) = args.first().map(|part| part.to_ascii_lowercase()) else {
+            self.push_output_line("usage: /rev start|stop|unwind|comm".to_string());
+            return;
+        };
+
+        match subcommand.as_str() {
+            "start" => {
+                self.rev_start();
+                self.push_output_line("reversion block started".to_string());
+            }
+            "stop" => {
+                self.rev_stop();
+                self.push_output_line("reversion block stopped".to_string());
+            }
+            "unwind" => {
+                self.rev_unwind();
+                self.push_output_line("reversion block unwound".to_string());
+            }
+            "comm" | "commutator" => {
+                self.rev_commutator();
+                self.push_output_line("reversion commutator applied".to_string());
+            }
+            _ => self.push_output_line(format!("unknown rev command: {}", args[0])),
+        }
+    }
+
+    fn status_lines(&self) -> Vec<String> {
+        let filter = if self.use_live_filter {
+            "live".to_string()
+        } else if self.filters.is_empty() {
+            "none".to_string()
+        } else {
+            format!(
+                "{} of {}",
+                self.filter_ind % self.filters.len() + 1,
+                self.filters.len()
+            )
+        };
+
+        vec![
+            format!("puzzle: {}^{}", self.puzzle.n, self.puzzle.d),
+            format!(
+                "moves: {}, redo: {}",
+                self.undo_history.len(),
+                self.redo_history.len()
+            ),
+            format!(
+                "keybinds: {}, {}",
+                self.keybind_set.name(),
+                self.keybind_axial.name()
+            ),
+            format!("filter: {}", filter),
+            format!("solved: {}", self.puzzle.is_solved()),
+        ]
+    }
+
+    fn move_lines(&self) -> Vec<String> {
+        if self.undo_history.is_empty() {
+            return vec!["no moves yet".to_string()];
+        }
+
+        let start = self.undo_history.len().saturating_sub(20);
+        self.undo_history[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, turn)| format!("{}: {:?}", start + i + 1, turn))
+            .collect()
     }
 
     // Main key dispatch. Handles damage-counter keys (scramble/reset),
@@ -612,6 +899,17 @@ impl AppState {
     // mode-specific try_* methods for turn input.
     pub fn process_key(&mut self, c: char) {
         self.message = None;
+        self.output_hint = None;
+        if matches!(self.mode, AppMode::Turn) && c == OUTPUT_PANEL_TOGGLE_KEY {
+            self.toggle_output_panel();
+            return;
+        }
+
+        if matches!(self.mode, AppMode::Turn) && c == '/' {
+            self.enter_command_mode();
+            return;
+        }
+
         if c == self.prefs.global_keys.scramble || c == self.prefs.global_keys.reset {
             match self.damage_counter {
                 None => self.damage_counter = Some((c, 1)),
@@ -628,20 +926,9 @@ impl AppState {
             if dr == self.prefs.damage_repeat {
                 self.flush_modes();
                 if ch == self.prefs.global_keys.scramble && self.puzzle.d >= 3 {
-                    self.puzzle = Puzzle::make_solved(self.puzzle.n, self.puzzle.d);
-                    self.puzzle.scramble(&mut self.rng);
-                    self.message = Some("scrambled with 5000 turns".to_string());
-                    self.scramble = self.puzzle.clone();
-                    self.undo_history = vec![];
-                    self.redo_history = vec![];
-                    self.rev_stack.clear();
+                    self.message = Some(self.scramble_puzzle());
                 } else if ch == self.prefs.global_keys.reset {
-                    self.puzzle = Puzzle::make_solved(self.puzzle.n, self.puzzle.d);
-                    self.message = Some("puzzle reset".to_string());
-                    self.scramble = self.puzzle.clone();
-                    self.undo_history = vec![];
-                    self.redo_history = vec![];
-                    self.rev_stack.clear();
+                    self.message = Some(self.reset_puzzle());
                 }
                 self.damage_counter = None;
             }
@@ -654,11 +941,7 @@ impl AppState {
         {
             self.mode = AppMode::LiveFilter;
         } else if c == self.prefs.global_keys.save {
-            match self.save() {
-                Ok(()) => self.message = Some(format!("saved to {}", self.filename.display())),
-                //Err(err) => self.message = Some(format!("could not save: {}", err)),
-                Err(_err) => self.message = Some("could not save".to_string()),
-            }
+            self.message = Some(self.save_message());
         } else {
             match self.mode {
                 AppMode::Turn => {
@@ -735,6 +1018,8 @@ impl AppState {
                         }
                     }
                 }
+
+                AppMode::Command => {}
             }
         }
     }
@@ -748,17 +1033,27 @@ impl AppState {
         }
 
         match self.keybind_axial {
-            KeybindAxial::Axial => self
-                .prefs
-                .axes
-                .iter()
-                .position(|ax| ax.axis_key == c)
-                .map(|s| KeyPress { ch: c, axis: s as i16 }),
+            KeybindAxial::Axial => {
+                self.prefs
+                    .axes
+                    .iter()
+                    .position(|ax| ax.axis_key == c)
+                    .map(|s| KeyPress {
+                        ch: c,
+                        axis: s as i16,
+                    })
+            }
             KeybindAxial::Side => self.prefs.axes.iter().enumerate().find_map(|(s, ax)| {
                 (ax.pos.keys.side == c)
-                    .then_some(KeyPress { ch: c, axis: s as i16 })
+                    .then_some(KeyPress {
+                        ch: c,
+                        axis: s as i16,
+                    })
                     .or_else(|| {
-                        (ax.neg.keys.side == c).then_some(KeyPress { ch: c, axis: !(s as i16) })
+                        (ax.neg.keys.side == c).then_some(KeyPress {
+                            ch: c,
+                            axis: !(s as i16),
+                        })
                     })
             }),
         }
@@ -823,6 +1118,9 @@ impl AppState {
         if let Some(message) = &self.message {
             return message.to_string();
         }
+        if let Some(output_hint) = &self.output_hint {
+            return output_hint.to_string();
+        }
         match self.mode {
             AppMode::Turn => {
                 if !self.last_turn_keys.is_empty() {
@@ -832,6 +1130,7 @@ impl AppState {
                 }
             }
             AppMode::LiveFilter => format!("live filter: {}", self.live_filter_string),
+            AppMode::Command => format!("/{}", self.command_buffer),
         }
     }
 
@@ -990,6 +1289,117 @@ impl AppState {
     }
 }
 
+fn command_help_lines() -> Vec<String> {
+    vec![
+        "commands:".to_string(),
+        "/help - show this list".to_string(),
+        "/clear - clear the output panel".to_string(),
+        "/panel or ? - fold or unfold the output panel".to_string(),
+        "/status - show puzzle and input state".to_string(),
+        "/moves - show the last 20 moves".to_string(),
+        "/save - save the current session".to_string(),
+        "/scramble - scramble the puzzle".to_string(),
+        "/reset - reset the puzzle".to_string(),
+        "/rev start|stop|unwind|comm - manage reversion blocks".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScreenLayout {
+    puzzle_height: u16,
+    output_top: u16,
+    output_height: u16,
+    rev_row: u16,
+    status_row: u16,
+}
+
+impl ScreenLayout {
+    fn new(term_h: u16, state: &AppState) -> Self {
+        let base_rows = term_h.min(2);
+        let output_height = if state.output_panel_visible() {
+            term_h
+                .saturating_sub(base_rows + 1)
+                .min(OUTPUT_PANEL_MAX_HEIGHT)
+        } else {
+            0
+        };
+        let reserved = output_height + base_rows;
+        let puzzle_height = term_h.saturating_sub(reserved).max(1);
+        let output_top = puzzle_height;
+        let rev_row = term_h.saturating_sub(2);
+        let status_row = term_h.saturating_sub(1);
+
+        Self {
+            puzzle_height,
+            output_top,
+            output_height,
+            rev_row,
+            status_row,
+        }
+    }
+}
+
+fn draw_output_panel(
+    stdout: &mut io::Stdout,
+    state: &AppState,
+    layout: ScreenLayout,
+    term_w: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if layout.output_height == 0 {
+        return Ok(());
+    }
+
+    let end = state.output_lines.len().saturating_sub(state.output_scroll);
+    let start = end.saturating_sub(layout.output_height as usize);
+    let visible = &state.output_lines[start..end];
+
+    for i in 0..layout.output_height {
+        stdout
+            .queue(cursor::MoveTo(0, layout.output_top + i))?
+            .queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
+        if let Some(line) = visible.get(i as usize) {
+            stdout.queue(style::Print(truncate_to_width(line, term_w)))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn draw_status_line(
+    stdout: &mut io::Stdout,
+    state: &AppState,
+    row: u16,
+    term_w: u16,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    stdout
+        .queue(cursor::MoveTo(0, row))?
+        .queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
+
+    let show_hint = state.output_hint.as_deref() == Some(message) && !state.output_panel_open;
+    if !show_hint {
+        stdout.queue(style::Print(truncate_to_width(message, term_w)))?;
+        return Ok(());
+    }
+
+    let hint_len = OUTPUT_PANEL_HINT.chars().count() as u16;
+    let message_width = term_w.saturating_sub(hint_len);
+    let display_message = truncate_to_width(message, message_width.max(1));
+    let used = display_message.chars().count() as u16;
+    stdout.queue(style::Print(display_message))?;
+
+    if used < term_w {
+        let hint = truncate_to_width(OUTPUT_PANEL_HINT, term_w - used);
+        stdout.queue(style::PrintStyledContent(hint.with(style::Color::DarkGrey)))?;
+    }
+
+    Ok(())
+}
+
+fn truncate_to_width(line: &str, width: u16) -> String {
+    line.chars().take(width as usize).collect()
+}
+
 fn draw_brackets(
     stdout: &mut io::Stdout,
     x: i16,
@@ -1123,8 +1533,9 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
     const SCROLL_STEP_WHEEL: i16 = 3;
 
     let (mut term_w, mut term_h) = terminal::size()?;
+    let mut screen_layout = ScreenLayout::new(term_h, &state);
     let mut scroll_max_x = layout.width.saturating_sub(term_w) as i16;
-    let mut scroll_max_y = layout.height.saturating_sub(term_h.saturating_sub(2)) as i16;
+    let mut scroll_max_y = layout.height.saturating_sub(screen_layout.puzzle_height) as i16;
     let mut scroll_x: i16 = 0;
     let mut scroll_y: i16 = 0;
     let mut prev_mouse_pos: Option<(u16, u16)> = None;
@@ -1133,8 +1544,11 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
     const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
     'event: loop {
+        let previous_screen_layout = screen_layout;
         let previous_message = state.get_message();
         let previous_rev_stack = state.rev_stack_display();
+        let previous_output_lines = state.output_lines.clone();
+        let previous_output_scroll = state.output_scroll;
         let previous_hovered = state.hovered;
         let previous_clicked_stickers = state.clicked_stickers();
         let mut just_resized = false;
@@ -1149,73 +1563,95 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
                     kind: KeyEventKind::Press,
                     modifiers,
                     ..
-                }) => match code {
-                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+                }) => {
+                    if matches!(code, KeyCode::Char('c'))
+                        && modifiers.contains(KeyModifiers::CONTROL)
+                    {
                         break 'event;
                     }
-                    KeyCode::F(1) => state.rev_start(),
-                    KeyCode::F(2) => state.rev_stop(),
-                    KeyCode::F(3) => state.rev_unwind(),
-                    KeyCode::F(4) => state.rev_commutator(),
-                    KeyCode::Char(c) => {
-                        if c == state.prefs.global_keys.rev_start {
-                            state.rev_start();
-                        } else if c == state.prefs.global_keys.rev_stop {
-                            state.rev_stop();
-                        } else if c == state.prefs.global_keys.rev_unwind {
-                            state.rev_unwind();
-                        } else if c == state.prefs.global_keys.rev_commutator {
-                            state.rev_commutator();
-                        } else {
-                            state.process_key(c);
+
+                    match code {
+                        KeyCode::PageUp if state.output_panel_open => {
+                            state.output_scroll = state.output_scroll.saturating_add(5);
+                            continue;
                         }
+                        KeyCode::PageDown if state.output_panel_open => {
+                            state.output_scroll = state.output_scroll.saturating_sub(5);
+                            continue;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Tab => {
-                        state.process_key('\t');
+
+                    if matches!(state.mode, AppMode::Command) {
+                        state.process_command_key(code);
+                        continue;
                     }
-                    KeyCode::Esc => {
-                        state.process_key(ESCAPE_CODE);
+
+                    match code {
+                        KeyCode::F(1) => state.rev_start(),
+                        KeyCode::F(2) => state.rev_stop(),
+                        KeyCode::F(3) => state.rev_unwind(),
+                        KeyCode::F(4) => state.rev_commutator(),
+                        KeyCode::Char(c) => {
+                            if c == state.prefs.global_keys.rev_start {
+                                state.rev_start();
+                            } else if c == state.prefs.global_keys.rev_stop {
+                                state.rev_stop();
+                            } else if c == state.prefs.global_keys.rev_unwind {
+                                state.rev_unwind();
+                            } else if c == state.prefs.global_keys.rev_commutator {
+                                state.rev_commutator();
+                            } else {
+                                state.process_key(c);
+                            }
+                        }
+                        KeyCode::Tab => {
+                            state.process_key('\t');
+                        }
+                        KeyCode::Esc => {
+                            state.process_key(ESCAPE_CODE);
+                        }
+                        KeyCode::Enter => {
+                            state.process_key('\n');
+                        }
+                        KeyCode::Backspace => {
+                            state.process_key(BACKSPACE_CODE);
+                        }
+                        KeyCode::Up => {
+                            let step = if modifiers.contains(KeyModifiers::CONTROL) {
+                                1
+                            } else {
+                                (screen_layout.puzzle_height as i16 * 3 / 4).max(1)
+                            };
+                            scroll_y = (scroll_y - step).max(0);
+                        }
+                        KeyCode::Down => {
+                            let step = if modifiers.contains(KeyModifiers::CONTROL) {
+                                1
+                            } else {
+                                (screen_layout.puzzle_height as i16 * 3 / 4).max(1)
+                            };
+                            scroll_y = (scroll_y + step).min(scroll_max_y);
+                        }
+                        KeyCode::Left => {
+                            let step = if modifiers.contains(KeyModifiers::CONTROL) {
+                                1
+                            } else {
+                                (term_w as i16 * 3 / 4).max(1)
+                            };
+                            scroll_x = (scroll_x - step).max(0);
+                        }
+                        KeyCode::Right => {
+                            let step = if modifiers.contains(KeyModifiers::CONTROL) {
+                                1
+                            } else {
+                                (term_w as i16 * 3 / 4).max(1)
+                            };
+                            scroll_x = (scroll_x + step).min(scroll_max_x);
+                        }
+                        _ => (),
                     }
-                    KeyCode::Enter => {
-                        state.process_key('\n');
-                    }
-                    KeyCode::Backspace => {
-                        state.process_key(BACKSPACE_CODE);
-                    }
-                    KeyCode::Up => {
-                        let step = if modifiers.contains(KeyModifiers::CONTROL) {
-                            1
-                        } else {
-                            (term_h.saturating_sub(2) as i16 * 3 / 4).max(1)
-                        };
-                        scroll_y = (scroll_y - step).max(0);
-                    }
-                    KeyCode::Down => {
-                        let step = if modifiers.contains(KeyModifiers::CONTROL) {
-                            1
-                        } else {
-                            (term_h.saturating_sub(2) as i16 * 3 / 4).max(1)
-                        };
-                        scroll_y = (scroll_y + step).min(scroll_max_y);
-                    }
-                    KeyCode::Left => {
-                        let step = if modifiers.contains(KeyModifiers::CONTROL) {
-                            1
-                        } else {
-                            (term_w as i16 * 3 / 4).max(1)
-                        };
-                        scroll_x = (scroll_x - step).max(0);
-                    }
-                    KeyCode::Right => {
-                        let step = if modifiers.contains(KeyModifiers::CONTROL) {
-                            1
-                        } else {
-                            (term_w as i16 * 3 / 4).max(1)
-                        };
-                        scroll_x = (scroll_x + step).min(scroll_max_x);
-                    }
-                    _ => (),
-                },
+                }
                 Event::Mouse(MouseEvent {
                     kind,
                     column,
@@ -1223,6 +1659,12 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
                     modifiers,
                     ..
                 }) => {
+                    if row >= screen_layout.puzzle_height {
+                        prev_mouse_pos = None;
+                        dragged = false;
+                        continue;
+                    }
+
                     match kind {
                         MouseEventKind::ScrollUp => {
                             if modifiers.contains(KeyModifiers::SHIFT) {
@@ -1305,8 +1747,9 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
                     let (new_w, new_h) = terminal::size()?;
                     term_w = new_w;
                     term_h = new_h;
+                    screen_layout = ScreenLayout::new(term_h, &state);
                     scroll_max_x = layout.width.saturating_sub(term_w) as i16;
-                    scroll_max_y = layout.height.saturating_sub(term_h.saturating_sub(2)) as i16;
+                    scroll_max_y = layout.height.saturating_sub(screen_layout.puzzle_height) as i16;
                     scroll_x = scroll_x.min(scroll_max_x);
                     scroll_y = scroll_y.min(scroll_max_y);
                     stdout.execute(terminal::Clear(terminal::ClearType::All))?;
@@ -1320,42 +1763,74 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             break 'event;
         }
 
+        screen_layout = ScreenLayout::new(term_h, &state);
+        scroll_max_x = layout.width.saturating_sub(term_w) as i16;
+        scroll_max_y = layout.height.saturating_sub(screen_layout.puzzle_height) as i16;
+        scroll_x = scroll_x.min(scroll_max_x);
+        scroll_y = scroll_y.min(scroll_max_y);
+
+        if screen_layout.output_height > 0 {
+            let max_output_scroll = state
+                .output_lines
+                .len()
+                .saturating_sub(screen_layout.output_height as usize);
+            state.output_scroll = state.output_scroll.min(max_output_scroll);
+        } else {
+            state.output_scroll = 0;
+        }
+
         let scrolled = (scroll_x, scroll_y) != scroll_before;
-        if scrolled {
+        let screen_layout_changed = previous_screen_layout != screen_layout;
+        if scrolled || screen_layout_changed {
             stdout.execute(terminal::Clear(terminal::ClearType::All))?;
         }
 
         let message = state.get_message();
         let rev_stack_display = state.rev_stack_display();
+        let output_changed = previous_output_lines != state.output_lines
+            || previous_output_scroll != state.output_scroll;
 
         if just_resized {
             stdout
-                .queue(cursor::MoveTo(0, term_h.saturating_sub(2)))?
+                .queue(cursor::MoveTo(0, screen_layout.output_top))?
                 .queue(terminal::Clear(terminal::ClearType::All))?
                 .flush()?;
         }
-        if previous_rev_stack != rev_stack_display || scrolled || just_resized {
+
+        if output_changed || scrolled || just_resized || screen_layout_changed {
+            draw_output_panel(&mut stdout, &state, screen_layout, term_w)?;
+        }
+
+        if previous_rev_stack != rev_stack_display
+            || scrolled
+            || just_resized
+            || screen_layout_changed
+        {
             stdout
-                .queue(cursor::MoveTo(0, term_h.saturating_sub(2)))?
+                .queue(cursor::MoveTo(0, screen_layout.rev_row))?
                 .queue(terminal::Clear(terminal::ClearType::CurrentLine))?;
             if !rev_stack_display.is_empty() {
-                stdout.queue(style::Print(&format!(
-                    "RevStack: {}",
-                    rev_stack_display
-                )))?;
+                stdout.queue(style::Print(&format!("RevStack: {}", rev_stack_display)))?;
             }
         }
-        if previous_message != message || scrolled || just_resized {
-            stdout
-                .queue(cursor::MoveTo(0, term_h.saturating_sub(1)))?
-                .queue(terminal::Clear(terminal::ClearType::CurrentLine))?
-                .queue(style::Print(&message))?;
+        if previous_message != message || scrolled || just_resized || screen_layout_changed {
+            draw_status_line(
+                &mut stdout,
+                &state,
+                screen_layout.status_row,
+                term_w,
+                &message,
+            )?;
         }
 
         if let Some((x, y)) = previous_hovered {
             let sx = x - scroll_x;
             let sy = y - scroll_y;
-            if sx >= 1 && (sx as u16) < term_w && sy >= 0 && (sy as u16) < term_h.saturating_sub(2) {
+            if sx >= 1
+                && (sx as u16) < term_w
+                && sy >= 0
+                && (sy as u16) < screen_layout.puzzle_height
+            {
                 erase_brackets(&mut stdout, sx, sy)?;
             }
         }
@@ -1363,14 +1838,12 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
         if let Some((x, y)) = state.hovered {
             let sx = x - scroll_x;
             let sy = y - scroll_y;
-            if sx >= 1 && (sx as u16) < term_w && sy >= 0 && (sy as u16) < term_h.saturating_sub(2) {
-                draw_brackets(
-                    &mut stdout,
-                    sx,
-                    sy,
-                    ClickedStyle::Hovered,
-                    &state.prefs,
-                )?;
+            if sx >= 1
+                && (sx as u16) < term_w
+                && sy >= 0
+                && (sy as u16) < screen_layout.puzzle_height
+            {
+                draw_brackets(&mut stdout, sx, sy, ClickedStyle::Hovered, &state.prefs)?;
             }
         }
 
@@ -1387,7 +1860,7 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             if screen_x < 0
                 || screen_x >= term_w as i16
                 || screen_y < 0
-                || screen_y >= term_h.saturating_sub(2) as i16
+                || screen_y >= screen_layout.puzzle_height as i16
             {
                 continue;
             }
@@ -1455,14 +1928,18 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for (x, y) in erase_locs {
-            if x >= 1 && (x as u16) < term_w && y >= 0 && (y as u16) < term_h.saturating_sub(2) {
+            if x >= 1 && (x as u16) < term_w && y >= 0 && (y as u16) < screen_layout.puzzle_height {
                 erase_brackets(&mut stdout, x, y)?;
             }
         }
 
         for style in CLICKED_STYLES {
             for (x, y) in clicked_locs.get(style).expect("contains") {
-                if *x >= 1 && (*x as u16) < term_w && *y >= 0 && (*y as u16) < term_h.saturating_sub(2) {
+                if *x >= 1
+                    && (*x as u16) < term_w
+                    && *y >= 0
+                    && (*y as u16) < screen_layout.puzzle_height
+                {
                     draw_brackets(&mut stdout, *x, *y, *style, &state.prefs)?;
                 }
             }
@@ -1474,7 +1951,7 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             if screen_x < 0
                 || screen_x >= term_w as i16
                 || screen_y < 0
-                || screen_y >= term_h.saturating_sub(2) as i16
+                || screen_y >= screen_layout.puzzle_height as i16
             {
                 continue;
             }
@@ -1483,9 +1960,8 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             let color;
             if let Some(side) = side {
                 ch = if (state.current_turn.side.is_none()
-                        && state.current_turn.layer != Some(TurnLayer::WholePuzzle))
-                    || (state.keybind_set == KeybindSet::FixedKey
-                        && state.puzzle.d == 3)
+                    && state.current_turn.layer != Some(TurnLayer::WholePuzzle))
+                    || (state.keybind_set == KeybindSet::FixedKey && state.puzzle.d == 3)
                     || state.keybind_set == KeybindSet::ThreeKeyStrict
                 {
                     if *side >= 0 {
@@ -1522,7 +1998,9 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        stdout.queue(cursor::MoveTo(0, term_h.saturating_sub(1)))?.flush()?;
+        stdout
+            .queue(cursor::MoveTo(0, screen_layout.status_row))?
+            .flush()?;
 
         if state.alert > 0 {
             state.alert -= 1;
@@ -1539,4 +2017,3 @@ pub fn main_inner() -> Result<(), Box<dyn std::error::Error>> {
     drop(stdout_manager);
     Ok(())
 }
-

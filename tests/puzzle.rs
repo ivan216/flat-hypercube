@@ -86,9 +86,11 @@ fn batch_positions_match_sequential_positions() {
             assert!(puzzle.turn_position(pos, turn).is_some());
         }
     }
-    assert!(puzzle
-        .apply_turns_to_positions_batch(&mut batch, &turns)
-        .is_some());
+    assert!(
+        puzzle
+            .apply_turns_to_positions_batch(&mut batch, &turns)
+            .is_some()
+    );
 
     assert_eq!(sequential, batch);
 }
